@@ -36,32 +36,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure Tauri project exists
-        shell: bash
-        run: |
-          if [ ! -d "src-tauri" ]; then
-            echo "::error::Tauri project folder 'src-tauri' not found. Make sure you've added Tauri to this repo (npx tauri init) before running CI."
-            exit 1
-          fi
-
       - name: Install system dependencies (Ubuntu)
         shell: bash
         run: |
           set -eux
           sudo apt-get update
-          # Try WebKitGTK 4.1 first (Ubuntu 24.04), fall back to 4.0 (22.04)
           sudo apt-get install -y \
             build-essential pkg-config libssl-dev librsvg2-dev patchelf \
-            libayatana-appindicator3-dev || true
-          if sudo apt-get install -y libwebkit2gtk-4.1-dev; then
-            echo "Installed libwebkit2gtk-4.1-dev"
+            curl git ca-certificates
+          # Prefer WebKitGTK 4.1 (Ubuntu 24.04+), fallback to 4.0 (22.04)
+          if sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev; then
+            echo "Installed WebKitGTK 4.1 and ayatana appindicator"
           else
-            echo "Falling back to libwebkit2gtk-4.0-dev"
-            sudo apt-get install -y libwebkit2gtk-4.0-dev
-          fi
-          # Fallback to old appindicator if ayatana package was unavailable
-          if ! dpkg -s libayatana-appindicator3-dev >/dev/null 2>&1; then
-            sudo apt-get install -y libappindicator3-dev || true
+            sudo apt-get install -y libwebkit2gtk-4.0-dev libappindicator3-dev
           fi
 
       - name: Setup Node.js (LTS)
@@ -82,24 +69,20 @@ jobs:
             echo "manager=pnpm" >> $GITHUB_OUTPUT
             echo "install=pnpm install --frozen-lockfile" >> $GITHUB_OUTPUT
             echo "build=pnpm build" >> $GITHUB_OUTPUT
-            echo "cache=pnpm" >> $GITHUB_OUTPUT
             corepack prepare pnpm@latest --activate
           elif [ -f yarn.lock ]; then
             echo "manager=yarn" >> $GITHUB_OUTPUT
             echo "install=yarn install --frozen-lockfile" >> $GITHUB_OUTPUT
             echo "build=yarn build" >> $GITHUB_OUTPUT
-            echo "cache=yarn" >> $GITHUB_OUTPUT
             corepack prepare yarn@stable --activate
           elif [ -f package-lock.json ]; then
             echo "manager=npm" >> $GITHUB_OUTPUT
             echo "install=npm ci" >> $GITHUB_OUTPUT
             echo "build=npm run build" >> $GITHUB_OUTPUT
-            echo "cache=npm" >> $GITHUB_OUTPUT
           else
             echo "manager=npm" >> $GITHUB_OUTPUT
             echo "install=npm install" >> $GITHUB_OUTPUT
             echo "build=npm run build" >> $GITHUB_OUTPUT
-            echo "cache=npm" >> $GITHUB_OUTPUT
           fi
 
       - name: Restore Node cache
@@ -110,6 +93,101 @@ jobs:
             ~/.cache/yarn
             ~/.pnpm-store
           key: node-${{ steps.pm.outputs.manager }}-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml', '**/yarn.lock', '**/package-lock.json') }}
+
+      - name: Install frontend dependencies
+        run: ${{ steps.pm.outputs.install }}
+
+      - name: Build frontend
+        run: ${{ steps.pm.outputs.build }}
+
+      - name: Bootstrap minimal Tauri wrapper if missing (AppImage+DEB)
+        shell: bash
+        run: |
+          set -eux
+          if [ -d src-tauri ]; then
+            echo "src-tauri exists; skipping bootstrap."
+            exit 0
+          fi
+
+          # Detect built frontend output directory
+          DIST_DIR="dist"
+          if [ -d "build" ]; then DIST_DIR="build"; fi
+          if [ ! -d "$DIST_DIR" ]; then
+            echo "::error::Could not find built frontend directory (dist or build). Ensure your build step outputs one of these."
+            exit 1
+          fi
+
+          mkdir -p src-tauri/src
+
+          # Write Tauri config for Ubuntu job (AppImage + DEB)
+          cat > src-tauri/tauri.conf.json <<'JSON'
+          {
+            "$schema": "https://schema.tauri.app/config/2",
+            "productName": "Signal",
+            "version": "0.1.0",
+            "identifier": "app.signalmidi.desktop",
+            "build": {
+              "beforeDevCommand": "npm run dev",
+              "beforeBuildCommand": "npm run build",
+              "devPath": "http://localhost:5173",
+              "distDir": "../__DIST_DIR__"
+            },
+            "app": {
+              "windows": [
+                { "title": "Signal", "width": 1280, "height": 800, "resizable": true }
+              ],
+              "security": {
+                "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: filesystem: ws: wss: http: https:"
+              }
+            },
+            "bundle": {
+              "targets": ["appimage", "deb"],
+              "icon": [],
+              "linux": {
+                "deb": {
+                  "depends": [
+                    "libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37",
+                    "libayatana-appindicator3-1 | libappindicator3-1",
+                    "librsvg2-2",
+                    "openssl"
+                  ]
+                }
+              }
+            }
+          }
+          JSON
+          sed -i "s#__DIST_DIR__#${DIST_DIR}#g" src-tauri/tauri.conf.json
+
+          # Cargo.toml
+          cat > src-tauri/Cargo.toml <<'TOML'
+          [package]
+          name = "signal-tauri"
+          version = "0.1.0"
+          description = "Signal MIDI Editor (Tauri wrapper)"
+          edition = "2021"
+
+          [build-dependencies]
+          tauri-build = "2"
+
+          [dependencies]
+          tauri = { version = "2", features = ["protocol-asset"] }
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+
+          [profile.release]
+          lto = true
+          codegen-units = 1
+          strip = "symbols"
+          TOML
+
+          # main.rs
+          cat > src-tauri/src/main.rs <<'RS'
+          fn main() {
+              tauri::Builder::default()
+                  .run(tauri::generate_context!())
+                  .expect("error while running tauri application");
+          }
+          RS
 
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -125,17 +203,9 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      - name: Install frontend dependencies
-        run: ${{ steps.pm.outputs.install }}
-
-      - name: Build frontend
-        run: ${{ steps.pm.outputs.build }}
-
       - name: Build Tauri (AppImage, DEB)
-        # Use npx to avoid requiring @tauri-apps/cli in package.json
         run: npx @tauri-apps/cli@latest build
         env:
-          # Ensure release build for smaller binaries
           TAURI_BUILD_ENVIRONMENT: production
 
       - name: Upload AppImage and DEB artifacts
@@ -167,14 +237,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure Tauri project exists
-        shell: bash
-        run: |
-          if [ ! -d "src-tauri" ]; then
-            echo "::error::Tauri project folder 'src-tauri' not found. Make sure you've added Tauri to this repo (npx tauri init) before running CI."
-            exit 1
-          fi
-
       - name: Setup Node.js (LTS)
         uses: actions/setup-node@v4
         with:
@@ -209,6 +271,100 @@ jobs:
             echo "build=npm run build" >> $GITHUB_OUTPUT
           fi
 
+      - name: Install frontend dependencies
+        run: ${{ steps.pm.outputs.install }}
+
+      - name: Build frontend
+        run: ${{ steps.pm.outputs.build }}
+
+      - name: Bootstrap minimal Tauri wrapper if missing (RPM)
+        shell: bash
+        run: |
+          set -eux
+          if [ -d src-tauri ]; then
+            echo "src-tauri exists; skipping bootstrap."
+            exit 0
+          fi
+
+          DIST_DIR="dist"
+          if [ -d "build" ]; then DIST_DIR="build"; fi
+          if [ ! -d "$DIST_DIR" ]; then
+            echo "::error::Could not find built frontend directory (dist or build). Ensure your build step outputs one of these."
+            exit 1
+          fi
+
+          mkdir -p src-tauri/src
+
+          # Tauri config for RPM build on Fedora
+          cat > src-tauri/tauri.conf.json <<'JSON'
+          {
+            "$schema": "https://schema.tauri.app/config/2",
+            "productName": "Signal",
+            "version": "0.1.0",
+            "identifier": "app.signalmidi.desktop",
+            "build": {
+              "beforeDevCommand": "npm run dev",
+              "beforeBuildCommand": "npm run build",
+              "devPath": "http://localhost:5173",
+              "distDir": "../__DIST_DIR__"
+            },
+            "app": {
+              "windows": [
+                { "title": "Signal", "width": 1280, "height": 800, "resizable": true }
+              ],
+              "security": {
+                "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: filesystem: ws: wss: http: https:"
+              }
+            },
+            "bundle": {
+              "targets": ["rpm"],
+              "icon": [],
+              "linux": {
+                "rpm": {
+                  "depends": [
+                    "webkit2gtk4.1",
+                    "libappindicator-gtk3",
+                    "librsvg2",
+                    "openssl"
+                  ]
+                }
+              }
+            }
+          }
+          JSON
+          sed -i "s#__DIST_DIR__#${DIST_DIR}#g" src-tauri/tauri.conf.json
+
+          # Cargo.toml
+          cat > src-tauri/Cargo.toml <<'TOML'
+          [package]
+          name = "signal-tauri"
+          version = "0.1.0"
+          description = "Signal MIDI Editor (Tauri wrapper)"
+          edition = "2021"
+
+          [build-dependencies]
+          tauri-build = "2"
+
+          [dependencies]
+          tauri = { version = "2", features = ["protocol-asset"] }
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+
+          [profile.release]
+          lto = true
+          codegen-units = 1
+          strip = "symbols"
+          TOML
+
+          # main.rs
+          cat > src-tauri/src/main.rs <<'RS'
+          fn main() {
+              tauri::Builder::default()
+                  .run(tauri::generate_context!())
+                  .expect("error while running tauri application");
+          }
+          RS
+
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
@@ -222,12 +378,6 @@ jobs:
           key: cargo-fedora-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             cargo-fedora-
-
-      - name: Install frontend dependencies
-        run: ${{ steps.pm.outputs.install }}
-
-      - name: Build frontend
-        run: ${{ steps.pm.outputs.build }}
 
       - name: Build Tauri (RPM)
         run: npx @tauri-apps/cli@latest build
@@ -266,7 +416,6 @@ jobs:
           TAG="${{ inputs.release_tag }}"
           NAME="${{ inputs.release_name }}"
           if [ -z "$TAG" ]; then
-            # Auto-generate a tag if none provided
             TAG="tauri-linux-$(date -u +%Y%m%d%H%M%S)"
           fi
           if [ -z "$NAME" ]; then

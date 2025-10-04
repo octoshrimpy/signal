@@ -100,6 +100,9 @@ jobs:
       - name: Build frontend
         run: ${{ steps.pm.outputs.build }}
 
+      # - name: Ensure .env exists if required
+      #   run: cp .env.example .env # Uncomment if you use .env for build
+
       - name: Bootstrap minimal Tauri wrapper if missing (AppImage+DEB)
         shell: bash
         run: |
@@ -128,9 +131,8 @@ jobs:
             "identifier": "app.signalmidi.desktop",
             "build": {
               "beforeDevCommand": "npm run dev",
-              "beforeBuildCommand": "npm run build",
-              "devPath": "http://localhost:5173",
-              "distDir": "../__DIST_DIR__"
+              "beforeBuildCommand": "npm run build"
+              // No devPath or distDir here!
             },
             "app": {
               "windows": [
@@ -156,7 +158,6 @@ jobs:
             }
           }
           JSON
-          sed -i "s#__DIST_DIR__#${DIST_DIR}#g" src-tauri/tauri.conf.json
 
           # Cargo.toml
           cat > src-tauri/Cargo.toml <<'TOML'
@@ -277,6 +278,9 @@ jobs:
       - name: Build frontend
         run: ${{ steps.pm.outputs.build }}
 
+      # - name: Ensure .env exists if required
+      #   run: cp .env.example .env # Uncomment if you use .env for build
+
       - name: Bootstrap minimal Tauri wrapper if missing (RPM)
         shell: bash
         run: |
@@ -304,9 +308,8 @@ jobs:
             "identifier": "app.signalmidi.desktop",
             "build": {
               "beforeDevCommand": "npm run dev",
-              "beforeBuildCommand": "npm run build",
-              "devPath": "http://localhost:5173",
-              "distDir": "../__DIST_DIR__"
+              "beforeBuildCommand": "npm run build"
+              // No devPath or distDir here!
             },
             "app": {
               "windows": [
@@ -332,7 +335,6 @@ jobs:
             }
           }
           JSON
-          sed -i "s#__DIST_DIR__#${DIST_DIR}#g" src-tauri/tauri.conf.json
 
           # Cargo.toml
           cat > src-tauri/Cargo.toml <<'TOML'
